@@ -24,8 +24,13 @@ import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.example.crawler.service.TaskPriorityService;
+import com.example.crawler.service.WorkerResourceMonitorService;
+import com.example.crawler.service.UserResourceLimitService;
+import com.example.crawler.strategy.TaskPriorityStrategy;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
@@ -55,6 +60,9 @@ public class CrawlerConsumerService {
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
     private final CloseableHttpClient httpClient;
+    private final TaskPriorityService taskPriorityService;
+    private final WorkerResourceMonitorService resourceMonitorService;
+    private final UserResourceLimitService userResourceLimitService;
 
     // HTTP请求配置
     private static final int CONNECT_TIMEOUT = 10000; // 10秒
@@ -63,10 +71,16 @@ public class CrawlerConsumerService {
 
     public CrawlerConsumerService(JobRepository jobRepository,
                                   RedisTemplate<String, String> redisTemplate,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  TaskPriorityService taskPriorityService,
+                                  WorkerResourceMonitorService resourceMonitorService,
+                                  UserResourceLimitService userResourceLimitService) {
         this.jobRepository = jobRepository;
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.taskPriorityService = taskPriorityService;
+        this.resourceMonitorService = resourceMonitorService;
+        this.userResourceLimitService = userResourceLimitService;
         
         // 创建HTTP客户端
         this.httpClient = HttpClients.createDefault();
@@ -76,7 +90,7 @@ public class CrawlerConsumerService {
      * Kafka消费者：消费爬虫任务消息
      * 
      * <p>使用@KafkaListener注解监听Kafka主题。
-     * 手动提交offset，确保消息处理成功后才提交。
+     * 收到消息后，将任务添加到优先级队列，而不是立即处理。
      * </p>
      * 
      * @param message 任务消息JSON字符串
@@ -98,6 +112,7 @@ public class CrawlerConsumerService {
             String jobId = (String) taskMessage.get("jobId");
             @SuppressWarnings("unchecked")
             List<String> urls = (List<String>) taskMessage.get("urls");
+            String userId = (String) taskMessage.get("userId");
 
             if (jobId == null || urls == null || urls.isEmpty()) {
                 logger.error("Invalid task message format: {}", message);
@@ -105,17 +120,55 @@ public class CrawlerConsumerService {
                 return;
             }
 
-            // 处理任务
-            processCrawlerTask(jobId, urls);
+            // 将任务添加到优先级队列（不立即处理）
+            taskPriorityService.addTask(jobId, userId, urls);
+            logger.info("Task added to priority queue: jobId={}, userId={}, urls={}", 
+                    jobId, userId, urls.size());
 
-            // 手动提交offset
+            // 立即提交offset（任务已在优先级队列中）
             acknowledgment.acknowledge();
-            logger.info("Successfully processed crawler job: jobId={}", jobId);
 
         } catch (Exception e) {
             logger.error("Error processing crawler job message", e);
             // 发生错误时不提交offset，让消息重新消费
-            // 在实际生产环境中，可以考虑重试机制或死信队列
+        }
+    }
+
+    /**
+     * 定时任务：从优先级队列中获取任务并处理（每2秒执行一次）
+     */
+    @Scheduled(fixedDelay = 2000)
+    public void processPrioritizedTasks() {
+        try {
+            // 从优先级队列获取下一个可执行的任务
+            TaskPriorityStrategy.PrioritizedTask task = taskPriorityService.getNextExecutableTask();
+            
+            if (task == null) {
+                // 没有可执行的任务
+                return;
+            }
+
+            logger.info("Processing prioritized task: jobId={}, userId={}, priority={}", 
+                    task.getJobId(), task.getUserId(), task.getPriorityScore());
+
+            // 获取任务的URL列表
+            List<String> urls = taskPriorityService.getTaskUrls(task.getJobId());
+            if (urls == null || urls.isEmpty()) {
+                logger.error("URLs not found for task: {}", task.getJobId());
+                taskPriorityService.removeTask(task.getJobId());
+                return;
+            }
+
+            // 注册资源使用
+            int threadCount = task.getResourceEstimate().getEstimatedThreads();
+            resourceMonitorService.registerJobStart(task.getJobId(), threadCount);
+            userResourceLimitService.recordUserResourceUsage(task.getUserId(), threadCount);
+
+            // 处理任务
+            processCrawlerTask(task.getJobId(), urls, task.getUserId(), threadCount);
+            
+        } catch (Exception e) {
+            logger.error("Error processing prioritized tasks", e);
         }
     }
 
@@ -143,20 +196,31 @@ public class CrawlerConsumerService {
      *   <li>收集所有URL的HTML内容</li>
      *   <li>更新MySQL：设置状态为SUCCEEDED，填充结果HTML</li>
      *   <li>清理Redis实时状态</li>
+     *   <li>释放资源</li>
      * </ol>
      * </p>
      */
     @Transactional
-    public void processCrawlerTask(String jobId, List<String> urls) {
-        logger.info("Processing crawler task: jobId={}, urlsCount={}", jobId, urls.size());
+    public void processCrawlerTask(String jobId, List<String> urls, String userId, int threadCount) {
+        logger.info("Processing crawler task: jobId={}, userId={}, urlsCount={}, threads={}", 
+                jobId, userId, urls.size(), threadCount);
 
+        long startTime = System.currentTimeMillis();
         int totalUrls = urls.size();
         int succeeded = 0;
         int failed = 0;
         StringBuilder resultHtml = new StringBuilder();
 
         try {
-            // 1. 更新Redis实时状态为RUNNING
+            // 1. 更新任务开始时间
+            Optional<JobEntity> jobEntityOpt = jobRepository.findById(jobId);
+            if (jobEntityOpt.isPresent()) {
+                JobEntity jobEntity = jobEntityOpt.get();
+                jobEntity.setStartedAt(java.time.LocalDateTime.now());
+                jobRepository.save(jobEntity);
+            }
+
+            // 2. 更新Redis实时状态为RUNNING
             updateLiveStatus(jobId, JobStatus.RUNNING, totalUrls, 0, 0, "Starting to crawl...");
 
             // 2. 构建结果HTML头部
@@ -194,7 +258,7 @@ public class CrawlerConsumerService {
                     resultHtml.append(urlHtml);
                     resultHtml.append("</div>\n");
                     resultHtml.append("</div>\n");
-
+    
                     logger.info("Successfully crawled URL: {}", url);
 
                 } catch (Exception e) {
@@ -221,34 +285,49 @@ public class CrawlerConsumerService {
             resultHtml.append("<p>Completed at: ").append(java.time.LocalDateTime.now()).append("</p>\n");
             resultHtml.append("</body></html>");
 
-            // 5. 从MySQL加载JobEntity
+            // 5. 计算执行时长
+            long executionTime = System.currentTimeMillis() - startTime;
+
+            // 6. 从MySQL加载JobEntity
             Optional<JobEntity> jobEntityOpt = jobRepository.findById(jobId);
             if (jobEntityOpt.isEmpty()) {
                 logger.error("Job entity not found in database: {}", jobId);
+                // 释放资源
+                resourceMonitorService.registerJobComplete(jobId, threadCount);
+                userResourceLimitService.releaseUserResource(userId, threadCount);
+                taskPriorityService.removeTask(jobId);
                 return;
             }
 
             JobEntity jobEntity = jobEntityOpt.get();
 
-            // 6. 更新JobEntity：标记为成功，填充结果
+            // 7. 更新JobEntity：标记为成功，填充结果，记录执行时间
             jobEntity.setStatus(JobStatus.SUCCEEDED);
             jobEntity.setUrlsSucceeded(succeeded);
             jobEntity.setUrlsFailed(failed);
             jobEntity.setResultHtml(resultHtml.toString());
+            jobEntity.setExecutionTimeMs(executionTime);
+            jobEntity.setCompletedAt(java.time.LocalDateTime.now());
 
-            // 7. 保存到MySQL
+            // 8. 保存到MySQL
             jobRepository.save(jobEntity);
-            logger.info("Job completed successfully: jobId={}, succeeded={}, failed={}", jobId, succeeded, failed);
+            logger.info("Job completed successfully: jobId={}, succeeded={}, failed={}, executionTime={}ms", 
+                    jobId, succeeded, failed, executionTime);
 
-            // 8. 清理Redis实时状态（任务已完成，不再需要实时状态）
+            // 9. 清理Redis实时状态（任务已完成，不再需要实时状态）
             String liveStatusKey = RedisKeyConstants.buildLiveStatusKey(jobId);
             redisTemplate.delete(liveStatusKey);
             logger.debug("Cleaned up live status in Redis for jobId: {}", jobId);
 
+            // 10. 释放资源
+            resourceMonitorService.registerJobComplete(jobId, threadCount);
+            userResourceLimitService.releaseUserResource(userId, threadCount);
+            taskPriorityService.removeTask(jobId);
+
         } catch (Exception e) {
             logger.error("Error processing crawler task: {}", jobId, e);
             // 更新状态为失败
-            updateJobStatusToFailed(jobId);
+            updateJobStatusToFailed(jobId, userId, threadCount);
         }
     }
 
@@ -322,18 +401,24 @@ public class CrawlerConsumerService {
     /**
      * 更新任务状态为失败
      */
-    private void updateJobStatusToFailed(String jobId) {
+    private void updateJobStatusToFailed(String jobId, String userId, int threadCount) {
         try {
             Optional<JobEntity> jobEntityOpt = jobRepository.findById(jobId);
             if (jobEntityOpt.isPresent()) {
                 JobEntity jobEntity = jobEntityOpt.get();
                 jobEntity.setStatus(JobStatus.FAILED);
+                jobEntity.setCompletedAt(java.time.LocalDateTime.now());
                 jobRepository.save(jobEntity);
 
                 // 清理Redis状态
                 String liveStatusKey = RedisKeyConstants.buildLiveStatusKey(jobId);
                 redisTemplate.delete(liveStatusKey);
             }
+
+            // 释放资源
+            resourceMonitorService.registerJobComplete(jobId, threadCount);
+            userResourceLimitService.releaseUserResource(userId, threadCount);
+            taskPriorityService.removeTask(jobId);
         } catch (Exception e) {
             logger.error("Failed to update job status to FAILED for jobId: {}", jobId, e);
         }

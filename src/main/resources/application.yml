@@ -70,3 +70,14 @@ logging:
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
 
+# Crawler Worker Resource Configuration
+crawler:
+  worker:
+    total-instances: 1
+    max-threads-per-instance: 10
+  
+  user-resource-limit:
+    time-window-seconds: 3600  # 1小时
+    max-threads-per-window: 50  # 每个用户在时间窗口内最大线程数
+    max-jobs-per-window: 10     # 每个用户在时间窗口内最大任务数
+

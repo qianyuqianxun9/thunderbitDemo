@@ -95,14 +95,16 @@ public class JobService {
         jobEntity.setUrlsSubmitted(request.urls().size());
         jobEntity.setUrlsSucceeded(0);
         jobEntity.setUrlsFailed(0);
+        jobEntity.setUserId(request.userId()); // 保存用户ID
 
         jobRepository.save(jobEntity);
-        logger.info("Job entity saved to database: {}", jobId);
+        logger.info("Job entity saved to database: jobId={}, userId={}", jobId, request.userId());
 
         // 构建任务消息（JSON格式）
         Map<String, Object> taskMessage = new HashMap<>();
         taskMessage.put("jobId", jobId);
         taskMessage.put("urls", request.urls());
+        taskMessage.put("userId", request.userId()); // 包含用户ID
 
         try {
             String taskMessageJson = objectMapper.writeValueAsString(taskMessage);

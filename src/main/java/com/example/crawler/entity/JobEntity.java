@@ -59,6 +59,30 @@ public class JobEntity {
     private Integer urlsFailed = 0;
 
     /**
+     * 用户标识（用于资源限制和优先级分配）
+     */
+    @Column(length = 100)
+    private String userId;
+
+    /**
+     * 任务执行时长（毫秒）
+     */
+    @Column
+    private Long executionTimeMs;
+
+    /**
+     * 任务开始时间
+     */
+    @Column
+    private LocalDateTime startedAt;
+
+    /**
+     * 任务结束时间
+     */
+    @Column
+    private LocalDateTime completedAt;
+
+    /**
      * 创建时间（自动填充）
      */
     @CreationTimestamp
@@ -129,6 +153,38 @@ public class JobEntity {
 
     public void setUrlsFailed(Integer urlsFailed) {
         this.urlsFailed = urlsFailed;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public Long getExecutionTimeMs() {
+        return executionTimeMs;
+    }
+
+    public void setExecutionTimeMs(Long executionTimeMs) {
+        this.executionTimeMs = executionTimeMs;
+    }
+
+    public LocalDateTime getStartedAt() {
+        return startedAt;
+    }
+
+    public void setStartedAt(LocalDateTime startedAt) {
+        this.startedAt = startedAt;
+    }
+
+    public LocalDateTime getCompletedAt() {
+        return completedAt;
+    }
+
+    public void setCompletedAt(LocalDateTime completedAt) {
+        this.completedAt = completedAt;
     }
 
     public LocalDateTime getCreatedAt() {
